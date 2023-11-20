@@ -4,6 +4,8 @@ pragma solidity 0.8.4;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "hardhat/console.sol";
 
+error Streamer__ErrorAlreadyHasOpenChannel();
+
 contract Streamer is Ownable {
   event Opened(address, uint256);
   event Challenged(address);
@@ -13,7 +15,14 @@ contract Streamer is Ownable {
   mapping(address => uint256) balances;
   mapping(address => uint256) canCloseAt;
 
-  function fundChannel() public payable {
+  modifier doesNotHaveRunningChannel() {
+    if (balances[msg.sender] != 0) {
+      revert Streamer__ErrorAlreadyHasOpenChannel();
+    }
+    _;
+  }
+
+  function fundChannel() public payable doesNotHaveRunningChannel {
     /*
       Checkpoint 2: fund a channel
 
@@ -22,6 +31,9 @@ contract Streamer is Ownable {
       - updates the balances mapping with the eth received in the function call
       - emits an Opened event
     */
+    require(balances[msg.sender] == 0);
+    balances[msg.sender] = msg.value;
+    emit Opened(msg.sender, msg.value);
   }
 
   function timeLeft(address channel) public view returns (uint256) {
@@ -32,7 +44,7 @@ contract Streamer is Ownable {
     return canCloseAt[channel] - block.timestamp;
   }
 
-  function withdrawEarnings(Voucher calldata voucher) public {
+  function withdrawEarnings(Voucher calldata voucher) public onlyOwner {
     // like the off-chain code, signatures are applied to the hash of the data
     // instead of the raw data itself
     bytes32 hashed = keccak256(abi.encode(voucher.updatedBalance));
@@ -59,6 +71,14 @@ contract Streamer is Ownable {
           - adjust the channel balance, and pay the Guru(Contract owner). Get the owner address with the `owner()` function.
           - emit the Withdrawn event
     */
+    address recoveredSigner = ecrecover(prefixedHashed, voucher.sig.v, voucher.sig.r, voucher.sig.s);
+    require(balances[recoveredSigner] != 0);
+    require(balances[recoveredSigner] > voucher.updatedBalance, "Not enough ETH in Signer");
+    uint256 payout = balances[recoveredSigner] - voucher.updatedBalance;
+    balances[recoveredSigner] -= payout;
+    (bool success, ) = payable(owner()).call{value: payout}("");
+    require(success, "Transfer failed!");
+    emit Withdrawn(recoveredSigner, payout);
   }
 
   /*
@@ -69,6 +89,13 @@ contract Streamer is Ownable {
     - updates canCloseAt[msg.sender] to some future time
     - emits a Challenged event
   */
+  function challengeChannel() public {
+    require(balances[msg.sender] != 0, "Channel not open!");
+    if ((canCloseAt[msg.sender] == 0) || (canCloseAt[msg.sender] < block.timestamp)) {
+      canCloseAt[msg.sender] = block.timestamp + 30;
+    }
+    emit Challenged(msg.sender);
+  }
 
   /*
     Checkpoint 5b: Close the channel
@@ -79,6 +106,14 @@ contract Streamer is Ownable {
     - sends the channel's remaining funds to msg.sender, and sets the balance to 0
     - emits the Closed event
   */
+  function defundChannel() public {
+    require((canCloseAt[msg.sender] != 0) && (timeLeft(msg.sender) == 0), "Not a closing chalnnel");
+    uint256 remainingFunds = balances[msg.sender];
+    balances[msg.sender] = 0;
+    (bool success, ) = payable(msg.sender).call{value: remainingFunds}("");
+    require(success, "Transfer failed!");
+    emit Closed(msg.sender);
+  }
 
   struct Voucher {
     uint256 updatedBalance;
